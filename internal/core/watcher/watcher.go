@@ -43,6 +43,9 @@ func NewWatcher(baseDir string, r *registry.Registry, scanHandlers ...nodescan.H
 	}
 
 	for _, h := range scanHandlers {
+		if h == nil {
+			continue
+		}
 		if err := s.Register(h); err != nil {
 			return nil, err
 		}
@@ -163,8 +166,11 @@ func (w *Watcher) runWorkerLoop(ctx context.Context) {
 			w.dirtyMu.Unlock()
 
 			for _, svcName := range toScan {
-				w.scanner.Scan(svcName)
-				logs.Out.Debug("Targeted scan completed", zap.String("service", svcName))
+				if err := w.scanner.Scan(svcName); err != nil {
+					logs.Out.Error("Targeted scan failed", zap.String("service", svcName), zap.Error(err))
+				} else {
+					logs.Out.Debug("Targeted scan completed", zap.String("service", svcName))
+				}
 			}
 
 		case <-ticker.C:
