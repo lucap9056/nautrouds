@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"nautrouds/internal/core/builtins"
 	"nautrouds/internal/core/builtins/builtinsmware"
 	"nautrouds/internal/core/builtins/virtualservices"
+	"nautrouds/internal/core/mmfg"
 	"nautrouds/internal/rtree"
 	"strings"
 
@@ -14,6 +16,7 @@ import (
 
 func Parse(r io.Reader) (*rtree.RouteTree, error) {
 	var rawRules []rtree.RawNode
+	var ruleLines []int
 	var currentRule *rtree.RawNode
 	var skippingUntilBlank bool
 
@@ -42,7 +45,7 @@ func Parse(r io.Reader) (*rtree.RouteTree, error) {
 			continue
 		}
 
-		isIndent := strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "\t")
+		isIndent := strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "\t")
 
 		if !isIndent {
 			fields, err := shlex.Split(trimmed)
@@ -65,7 +68,10 @@ func Parse(r io.Reader) (*rtree.RouteTree, error) {
 				return nil, fmt.Errorf("line %d: invalid rule fields (expected 1-3, got %d): %s", lineCount, len(fields), trimmed)
 			}
 
-			// Compile-time validation for virtual services
+			if ok, bad := rtree.ValidateMethods(rule.Methods); !ok {
+				return nil, fmt.Errorf("line %d: unknown HTTP method: %s", lineCount, bad)
+			}
+
 			if strings.HasPrefix(rule.Service, "$") {
 				valid, name := virtualservices.IsValid(rule.Service)
 				if !valid {
@@ -74,9 +80,17 @@ func Parse(r io.Reader) (*rtree.RouteTree, error) {
 					}
 					return nil, fmt.Errorf("line %d: unknown virtual service: %s", lineCount, name)
 				}
+				if funcName, args, err := builtins.ParseDirective(rule.Service); err == nil {
+					if factory, ok := virtualservices.Registry[funcName]; ok && factory != nil {
+						if _, err := factory(args...); err != nil {
+							return nil, fmt.Errorf("line %d: %s", lineCount, err)
+						}
+					}
+				}
 			}
 
 			rawRules = append(rawRules, rule)
+			ruleLines = append(ruleLines, lineCount)
 			currentRule = &rawRules[len(rawRules)-1]
 
 		} else {
@@ -88,23 +102,12 @@ func Parse(r io.Reader) (*rtree.RouteTree, error) {
 			switch trimmed[0] {
 			case '@':
 				currentRule.Tags = append(currentRule.Tags, trimmed)
-			// Compile-time validation for built-in middlewares
 			case '$':
-				const mmfgPrefix = "$mmfg("
 				switch {
-				case strings.HasPrefix(trimmed, mmfgPrefix):
-					if !strings.HasSuffix(trimmed, ")") {
-						return nil, fmt.Errorf("line %d: invalid $mmfg syntax (missing closing paren): %s", lineCount, trimmed)
-					}
-					node := trimmed[len(mmfgPrefix) : len(trimmed)-1]
-					if node == "" {
-						return nil, fmt.Errorf("line %d: invalid $mmfg syntax (empty node name): %s", lineCount, trimmed)
-					}
-					if strings.ContainsAny(node, "()") {
-						return nil, fmt.Errorf("line %d: invalid $mmfg node name: %s", lineCount, trimmed)
-					}
 				case strings.HasPrefix(trimmed, "$mmfg"):
-					return nil, fmt.Errorf("line %d: invalid $mmfg syntax (expected $mmfg(nodeName)): %s", lineCount, trimmed)
+					if err := mmfg.ValidateDirective(trimmed); err != nil {
+						return nil, fmt.Errorf("line %d: %s", lineCount, err)
+					}
 				default:
 					valid, name := builtinsmware.IsValid(trimmed)
 					if !valid {
@@ -113,9 +116,21 @@ func Parse(r io.Reader) (*rtree.RouteTree, error) {
 						}
 						return nil, fmt.Errorf("line %d: unknown builtin middleware: %s", lineCount, name)
 					}
+					if funcName, args, err := builtins.ParseDirective(trimmed); err == nil {
+						if factory, ok := builtinsmware.Registry[funcName]; ok {
+							if _, err := factory(args...); err != nil {
+								return nil, fmt.Errorf("line %d: %s", lineCount, err)
+							}
+						}
+					}
 				}
 				fallthrough
 			default:
+				if !strings.HasPrefix(trimmed, "$") {
+					if err := validateExternalMiddleware(trimmed); err != nil {
+						return nil, fmt.Errorf("line %d: %s", lineCount, err)
+					}
+				}
 				currentRule.Middlewares = append(currentRule.Middlewares, trimmed)
 			}
 		}
@@ -126,8 +141,12 @@ func Parse(r io.Reader) (*rtree.RouteTree, error) {
 	}
 
 	var rawNodes []*rtree.RawNode
-	for _, rule := range rawRules {
-		for _, url := range expandField(rule.URL) {
+	for i, rule := range rawRules {
+		urls, err := expandField(rule.URL)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %s", ruleLines[i], err)
+		}
+		for _, url := range urls {
 			rawNodes = append(rawNodes, &rtree.RawNode{
 				Methods:     rule.Methods,
 				URL:         url,

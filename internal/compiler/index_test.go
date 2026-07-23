@@ -119,6 +119,29 @@ GET example.com/api svc
 	assert.ElementsMatch(t, []string{"$mmfg(mmfg-service/echo)"}, mws)
 }
 
+func TestParse_ValidMmfg_QuotedNodeName(t *testing.T) {
+	script := `
+GET example.com/api svc
+    $mmfg("mmfg-service/my node (echo)")
+`
+	tree, err := compiler.ParseString(script)
+	require.NoError(t, err)
+	require.NotNil(t, tree)
+
+	url := []byte("example.com/api")
+	rtree.ReverseHost(url)
+	node, exists := tree.Search(url)
+	require.True(t, exists)
+
+	mwCount := tree.ActionMetadata[node.ActionIndex+1]
+	var mws []string
+	for i := range mwCount {
+		mwMetaIndex := tree.ActionMetadata[node.ActionIndex+2+i]
+		mws = append(mws, tree.GetActionName(tree.ActionMetadata[mwMetaIndex]))
+	}
+	assert.ElementsMatch(t, []string{`$mmfg("mmfg-service/my node (echo)")`}, mws)
+}
+
 func TestParse_InvalidMmfg(t *testing.T) {
 	cases := []struct {
 		name string
@@ -128,6 +151,7 @@ func TestParse_InvalidMmfg(t *testing.T) {
 		{"EmptyNodeName", "$mmfg()"},
 		{"UnterminatedNodeName", "$mmfg(foo"},
 		{"NoParens", "$mmfg"},
+		{"TooManyArgs", "$mmfg(foo, bar)"},
 	}
 
 	for _, c := range cases {
@@ -141,4 +165,86 @@ GET example.com/api svc
 			assert.Contains(t, err.Error(), "invalid $mmfg")
 		})
 	}
+}
+
+func TestParse_InvalidMethod(t *testing.T) {
+	script := `
+GRT example.com/api svc
+`
+	_, err := compiler.ParseString(script)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown HTTP method: GRT")
+}
+
+func TestParse_InvalidMethod_InCommaList(t *testing.T) {
+	script := `
+GET,PSOT example.com/api svc
+`
+	_, err := compiler.ParseString(script)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown HTTP method: PSOT")
+}
+
+func TestParse_InvalidBuiltinArgCount(t *testing.T) {
+	script := `
+GET example.com/api svc
+    $SetHeader(a, b, c)
+`
+	_, err := compiler.ParseString(script)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "$SetHeader")
+}
+
+func TestParse_InvalidVirtualServiceArgCount(t *testing.T) {
+	script := `
+GET example.com/api $redirect(301)
+`
+	_, err := compiler.ParseString(script)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "$redirect")
+}
+
+func TestParse_ValidExternalMiddleware(t *testing.T) {
+	script := `
+GET example.com/api svc
+    auth-service(/check, header=X-User-Id)
+`
+	tree, err := compiler.ParseString(script)
+	require.NoError(t, err)
+	require.NotNil(t, tree)
+
+	url := []byte("example.com/api")
+	rtree.ReverseHost(url)
+	node, exists := tree.Search(url)
+	require.True(t, exists)
+
+	mwCount := tree.ActionMetadata[node.ActionIndex+1]
+	var mws []string
+	for i := range mwCount {
+		mwMetaIndex := tree.ActionMetadata[node.ActionIndex+2+i]
+		mws = append(mws, tree.GetActionName(tree.ActionMetadata[mwMetaIndex]))
+	}
+	assert.ElementsMatch(t, []string{"auth-service(/check, header=X-User-Id)"}, mws)
+}
+
+func TestParse_InvalidExternalMiddleware(t *testing.T) {
+	script := `
+GET example.com/api svc
+    auth-service(/check
+`
+	_, err := compiler.ParseString(script)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "line 3")
+}
+
+func TestParse_UnclosedBracketInURL(t *testing.T) {
+	script := `
+GET example.com/api svc-1
+
+GET example.[com svc-2
+`
+	_, err := compiler.ParseString(script)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "line 4")
+	assert.Contains(t, err.Error(), "unclosed")
 }
