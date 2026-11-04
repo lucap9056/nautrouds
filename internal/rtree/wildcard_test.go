@@ -1,8 +1,12 @@
 package rtree_test
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"nautrouds/internal/rtree"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -115,4 +119,145 @@ func TestHostReversalAndVariableLengths(t *testing.T) {
 	nodeL, existsL := tree.Search(urlLong)
 	assert.True(t, existsL)
 	assert.Equal(t, "global-status-service", getServiceName(tree, nodeL.ActionIndex))
+}
+
+func TestStaticLeafFallsBackToWildcard(t *testing.T) {
+	cases := []struct {
+		routes []string
+		url    string
+		want   string
+	}{
+		{[]string{"/api/*", "/api/health"}, "/api/health", "/api/health"},
+		{[]string{"/api/*", "/api/health"}, "/api/healthz", "/api/*"},
+		{[]string{"/api/*", "/api/health"}, "/api/health/x", "/api/*"},
+		{[]string{"/x/**", "/x/ab"}, "/x/abc", "/x/**"},
+		{[]string{"/x/**", "/x/ab"}, "/x/ab/c", "/x/**"},
+		{[]string{"/user/*", "/user/me"}, "/user/meow", "/user/*"},
+		{[]string{"/x/*/**", "/x/ab"}, "/x/ab/zz", "/x/*/**"},
+		{[]string{"/a/**x/y", "/a/x"}, "/a/x/y", "/a/**x/y"},
+		{[]string{"/a/**x/y", "/a/x", "/a/x/z"}, "/a/x/y", "/a/**x/y"},
+	}
+
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%v %s", c.routes, c.url), func(t *testing.T) {
+			rawNodes := make([]*rtree.RawNode, 0, len(c.routes))
+			for _, route := range c.routes {
+				rawNodes = append(rawNodes, &rtree.RawNode{URL: "example.com" + route, Service: route, Methods: "GET"})
+			}
+
+			tree := rtree.Build(rawNodes)
+			require.NotNil(t, tree)
+
+			node, exists := tree.Search(prepareURL("example.com" + c.url))
+			require.True(t, exists)
+			assert.Equal(t, c.want, getServiceName(tree, node.ActionIndex))
+		})
+	}
+}
+
+func TestWildcardLeafMatchPriority(t *testing.T) {
+	cases := []struct {
+		routes []string
+		url    string
+		want   string
+	}{
+		{[]string{"/a/b**", "/a/*"}, "/a/b", "/a/*"},
+		{[]string{"/a/b*", "/a/*"}, "/a/b", "/a/*"},
+		{[]string{"/a/b*", "/a/**"}, "/a/b", "/a/**"},
+		{[]string{"/a/b*", "/a/*"}, "/a/bz", "/a/b*"},
+		{[]string{"/a/*", "/a/**"}, "/a/x", "/a/*"},
+		{[]string{"/a/**.json*", "/a/**"}, "/a/x.json", "/a/**"},
+		{[]string{"/a/**.json*", "/a/**"}, "/a/x.json/y.json", "/a/**.json*"},
+		{[]string{"/a/**.json*", "/a/**"}, "/a/x.jsonp", "/a/**.json*"},
+		{[]string{"/a/**.json*", "/a/**"}, "/a/x/y.json", "/a/**"},
+		{[]string{"/a/**", "/a/**/x/y", "/a/**/*"}, "/a/q/x/y", "/a/**/x/y"},
+		{[]string{"/a/**", "/a/**/x/y", "/a/**/*"}, "/a/q/x/z", "/a/**/*"},
+		{[]string{"/a/**", "/a/**/x/y", "/a/**/*"}, "/a/q/b", "/a/**/*"},
+		{[]string{"/a/**", "/a/**/x/y"}, "/a/q/x/z", "/a/**"},
+		{[]string{"/a/**", "/a/**/x/y"}, "/a/q", "/a/**"},
+	}
+
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%v %s", c.routes, c.url), func(t *testing.T) {
+			rawNodes := make([]*rtree.RawNode, 0, len(c.routes))
+			for _, route := range c.routes {
+				rawNodes = append(rawNodes, &rtree.RawNode{URL: "example.com" + route, Service: route, Methods: "GET"})
+			}
+
+			tree := rtree.Build(rawNodes)
+			require.NotNil(t, tree)
+
+			node, exists := tree.Search(prepareURL("example.com" + c.url))
+			require.True(t, exists)
+			assert.Equal(t, c.want, getServiceName(tree, node.ActionIndex))
+		})
+	}
+}
+
+func TestWildcardLimitPerRoute(t *testing.T) {
+	atLimit := "example.com" + strings.Repeat("/*", rtree.MaxWildcardsPerRoute)
+	tree := rtree.Build([]*rtree.RawNode{{URL: atLimit, Service: "at-limit", Methods: "GET"}})
+	require.NotNil(t, tree)
+
+	node, exists := tree.Search(prepareURL("example.com" + strings.Repeat("/x", rtree.MaxWildcardsPerRoute)))
+	require.True(t, exists)
+	assert.Equal(t, "at-limit", getServiceName(tree, node.ActionIndex))
+
+	overLimit := "example.com" + strings.Repeat("/*", rtree.MaxWildcardsPerRoute) + "/**"
+	assert.PanicsWithValue(t,
+		fmt.Sprintf("[rtree] route %q has %d wildcards, exceeds the limit of %d", overLimit, rtree.MaxWildcardsPerRoute+1, rtree.MaxWildcardsPerRoute),
+		func() { rtree.Build([]*rtree.RawNode{{URL: overLimit, Service: "over-limit", Methods: "GET"}}) },
+	)
+}
+
+func TestFallbackAcrossWildcardsRestoresCursor(t *testing.T) {
+	deepStatic := "/a/b" + strings.Repeat("/*", 10) + "/c"
+	deepWildcard := "/a/*" + strings.Repeat("/*", 10) + "/d"
+
+	cases := []struct {
+		routes []string
+		url    string
+		want   string
+	}{
+		{[]string{"/a/b/*/*/*/c", "/a/*/*/*/d"}, "/a/b/x/x/d", "/a/*/*/*/d"},
+		{[]string{"/a/b/*/*/*/c", "/a/*/*/*/d"}, "/a/b/xx/yyy/zzzz/c", "/a/b/*/*/*/c"},
+		{[]string{"/a/b/*/c", "/a/**/d"}, "/a/b/xx/yy/d", "/a/**/d"},
+		{[]string{"/a/b/c/*/x", "/a/b/**/y"}, "/a/b/c/qq/y", "/a/b/**/y"},
+		{[]string{"/a/bc/*/*/x", "/a/*/*/*/y"}, "/a/bc/qq/rr/y", "/a/*/*/*/y"},
+		{[]string{"/a/*/b/*/c", "/a/*/**"}, "/a/xx/b/yy/z", "/a/*/**"},
+		{[]string{deepStatic, deepWildcard}, "/a/b" + strings.Repeat("/x", 10) + "/d", deepWildcard},
+		{[]string{deepStatic, deepWildcard}, "/a/b" + strings.Repeat("/x", 10) + "/c", deepStatic},
+	}
+
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%v %s", c.routes, c.url), func(t *testing.T) {
+			rawNodes := make([]*rtree.RawNode, 0, len(c.routes))
+			for _, route := range c.routes {
+				rawNodes = append(rawNodes, &rtree.RawNode{URL: "example.com" + route, Service: route, Methods: "GET"})
+			}
+
+			tree := rtree.Build(rawNodes)
+			require.NotNil(t, tree)
+
+			node, exists := tree.Search(prepareURL("example.com" + c.url))
+			require.True(t, exists)
+			assert.Equal(t, c.want, getServiceName(tree, node.ActionIndex))
+		})
+	}
+}
+
+func TestDuplicateRouteWarnsOnOverride(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	tree := rtree.Build([]*rtree.RawNode{
+		{URL: "example.com/x", Service: "getter", Methods: "GET"},
+		{URL: "example.com/y", Service: "other", Methods: "GET"},
+		{URL: "example.com/x", Service: "poster", Methods: "POST"},
+	})
+	require.NotNil(t, tree)
+
+	assert.Contains(t, logs.String(), `[rtree] Warning: route "example.com/x" [POST] overrides previous route "example.com/x" [GET]`)
+	assert.Equal(t, 1, strings.Count(logs.String(), "Warning"))
 }

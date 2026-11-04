@@ -6,6 +6,7 @@ import (
 	"nautrouds/internal/core/builtins"
 	"nautrouds/internal/core/builtins/virtualservices"
 	"nautrouds/internal/rtree"
+	"slices"
 	"strings"
 
 	"github.com/google/shlex"
@@ -36,6 +37,10 @@ func (t *Tracker) Parse(part *tokenizer.Part) error {
 		return fmt.Errorf("invalid rule syntax: %s", v)
 	}
 
+	if slices.Contains(fields, "") {
+		fmt.Printf("warning: line %d: empty quoted field in rule: %q\n", part.Line, v)
+	}
+
 	var methods, rawURL, service string
 
 	switch len(fields) {
@@ -53,6 +58,13 @@ func (t *Tracker) Parse(part *tokenizer.Part) error {
 
 	if ok, bad := rtree.ValidateMethods(methods); !ok {
 		return fmt.Errorf("unknown HTTP method: %s", bad)
+	}
+	if strings.Trim(methods, ", \t") == "" {
+		return fmt.Errorf("missing HTTP method: %s", v)
+	}
+
+	if service == "" {
+		return fmt.Errorf("empty service name: %s", v)
 	}
 
 	if strings.HasPrefix(service, "$") {
